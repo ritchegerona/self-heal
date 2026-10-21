@@ -41,6 +41,7 @@ destructive runs unattended.
 %autosetup
 
 %install
+mkdir -p %{buildroot}%{_unitdir} %{buildroot}%{_userunitdir}
 install -Dm755 self-heal            %{buildroot}%{_bindir}/self-heal
 install -Dm644 self-heal.conf       %{buildroot}%{_sysconfdir}/self-heal.conf
 install -Dm644 self-heal.logrotate  %{buildroot}%{_sysconfdir}/logrotate.d/self-heal
@@ -84,5 +85,5 @@ echo "  systemctl --user enable --now self-heal-user.timer"
 %systemd_postun self-heal.service
 
 %changelog
-* Wed Oct 22 2026 ritchegerona <ritchegerona@users.noreply.github.com> - 1.0.0-1
+* Thu Oct 22 2026 ritchegerona <ritchegerona@users.noreply.github.com> - 1.0.0-1
 - Initial release: two-tier repair engine, 15 checks, drill, btrfs scrub
