@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  self-heal — automatic diagnosis & repair engine for Fedora + KDE Plasma
+#
+#  Two tiers, chosen automatically:
+#    root  -> system tier : failed services, disk, rpmdb, journals, cups,
+#                           network, btrfs/SMART watchdog, zram sysctl
+#    user  -> user tier   : crashed Plasma/PipeWire/portal units, dead audio,
+#                           bloated ~/.cache, user flatpak repair
+#
+#  Usage:
+#    self-heal run [CHECK...]      apply fixes (default; used by timers)
+#    self-heal test [CHECK...]     dry-run: show what WOULD be done
+#    self-heal doctor [CHECK...]   verbose interactive run
+#    self-heal status              human-readable health summary
+#    self-heal checks              list available checks
+#    self-heal drill               live-fire test: injects safe failures and
+#                                  verifies the healing loop recovers them
+#  Options:
+#    --user / --system             force a tier
+#    --config FILE                 load only this config file
+#    --quiet                       suppress info toasts (fixes still notify)
+#    --no-notify                   never send desktop notifications
+#
+#  Exit code is 0 for timer runs (timers never look "failed");
+#  drill exits 1 if any test fails.
+#  All fixes are logged to /var/log/self-heal.log (system) or
+#  ~/.local/state/self-heal.log (user) and shown as desktop notifications.
+# =============================================================================
+set -u
+
+SELF_HEAL_VERSION="1.0.0"
+
+# ---------------------------------------------------------------- defaults --
+NOTIFICATIONS=1
+QUIET=0
+
+SERVICE_ALLOWLIST="NetworkManager cups bluetooth chronyd sshd systemd-resolved"
+DISK_THRESHOLD=85
+DISK_CRITICAL=92
+JOURNAL_MAX=500M
+BOOT_THRESHOLD=80
+KERNELS_KEEP=2
+AUTO_REMOVE_OLD_KERNELS=0
+AUTO_FIX_RPMDB=1
+AUTO_CANCEL_CUPS=1
+FLATPAK_REPAIR=1
+NETWORK_AUTO_BOUNCE=1
+NET_FAILS_BEFORE_BOUNCE=3
+SMART_CHECK=1
+BTRFS_WATCH=1
+SWAPPINESS_FIX=1
+
+USER_SERVICE_ALLOWLIST="pipewire pipewire-pulse wireplumber xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-kde plasma-plasmashell"
+AUDIO_AUTO_FIX=1
+USER_CACHE_MAX_MB=2048
+THUMBNAIL_MAX_MB=300
+USER_FLATPAK_REPAIR=1
+
+# ------------------------------------------------------------------- args --
+TIER="auto"; MODE="run"; DRY_RUN=0; VERBOSE=0; NO_NOTIFY=0; CONFIG_FILE=""
+ONLY_CHECKS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user)   TIER="user" ;;
+    --system) TIER="system" ;;
+    --quiet)  QUIET=1 ;;
+    --no-notify) NO_NOTIFY=1 ;;
+    --config) shift; CONFIG_FILE="$1" ;;
+    run)      MODE="run" ;;
+    test)     MODE="run"; DRY_RUN=1; VERBOSE=1 ;;
+    doctor)   MODE="run"; VERBOSE=1 ;;
+    drill)    MODE="drill" ;;
+    status)   MODE="status" ;;
+    checks)   MODE="checks" ;;
+    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    check)    shift; ONLY_CHECKS=("$@"); break ;;
+    *)        ONLY_CHECKS=("$@"); break ;;
+  esac
+  shift
+done
+# normalise: "run foo bar" style too
+if [ "${#ONLY_CHECKS[@]}" -gt 0 ] && [ "${ONLY_CHECKS[0]}" = "run" -o "${ONLY_CHECKS[0]}" = "test" -o "${ONLY_CHECKS[0]}" = "doctor" ]; then
+  ONLY_CHECKS=("${ONLY_CHECKS[@]:1}")
+fi
+
+# ---------------------------------------------------------------- identity --
+if [ "$(id -u)" -eq 0 ]; then ROOT=1; else ROOT=0; fi
+if [ "$TIER" = "auto" ]; then
+  if [ "$ROOT" -eq 1 ]; then TIER="system"; else TIER="user"; fi
+fi
+if [ "$TIER" = "system" ] && [ "$ROOT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+  echo "self-heal: system tier needs root (try: sudo self-heal run) or use --user/--dry-run" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------- config ----
+if [ -n "$CONFIG_FILE" ]; then
+  [ -r "$CONFIG_FILE" ] || { echo "self-heal: config not readable: $CONFIG_FILE" >&2; exit 1; }
+  . "$CONFIG_FILE"
+  LOG_FILE="/dev/null"
+  STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/self-heal"
+elif [ "$TIER" = "system" ]; then
+  for cf in /etc/self-heal.conf; do [ -r "$cf" ] && . "$cf"; done
+  LOG_FILE="/var/log/self-heal.log"
+  STATE_DIR="/var/lib/self-heal"
+else
+  [ -r /etc/self-heal.conf ] && . /etc/self-heal.conf
+  [ -r "$HOME/.config/self-heal.conf" ] && . "$HOME/.config/self-heal.conf"
+  LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/self-heal.log"
+  STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/self-heal"
+fi
+mkdir -p "$STATE_DIR" 2>/dev/null
+STATE_FILE="$STATE_DIR/state"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+
+# ---------------------------------------------------------------- helpers ---
+log()  { echo "$(date '+%Y-%m-%d %H:%M:%S') [$TIER] $*" >> "$LOG_FILE"; }
+vlog() { [ "$VERBOSE" -eq 1 ] && echo "  · $*"; return 0; }
+say()  { [ "$QUIET" -eq 0 ] && echo "$*"; return 0; }
+
+FIXED=0; WARNED=0
+ACTIONS=()
+fix()   { FIXED=$((FIXED+1)); ACTIONS+=("FIXED: $1"); log "FIXED: $1"; say "  ✔ $1"; }
+warn()  { WARNED=$((WARNED+1)); ACTIONS+=("WARN: $1"); log "WARN: $1"; say "  ⚠ $1"; }
+skip()  { log "skip: $1"; vlog "skip: $1"; return 0; }
+
+state_get() { # state_get KEY DEFAULT
+  local v; v=$(grep -m1 "^$1=" "$STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  echo "${v:-$2}"
+}
+state_set() { # state_set KEY VALUE
+  touch "$STATE_FILE" 2>/dev/null || return 0
+  grep -v "^$1=" "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null
+  echo "$1=$2" >> "$STATE_FILE"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+do_run() { # run a mutation command (respects dry-run)
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "    [dry-run] $*"
+    return 0
+  fi
+  "$@" >/dev/null 2>&1
+}
+
+notify() { # notify URGENCY TITLE BODY
+  [ "$NOTIFICATIONS" -eq 1 ] || return 0
+  [ "$NO_NOTIFY" -eq 0 ] || return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local urgency="$1" title="$2" body="$3"
+  if [ "$ROOT" -eq 1 ]; then
+    # reach every graphical user session from root
+    for bus in /run/user/*/bus; do
+      [ -S "$bus" ] || continue
+      local uid uname
+      uid=$(basename "$(dirname "$bus")")
+      uname=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+      [ -n "$uname" ] || continue
+      sudo -u "$uname" env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+        notify-send -u "$urgency" -a "Self-Heal" -i face-smile "$title" "$body" >/dev/null 2>&1
+    done
+  else
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+    notify-send -u "$urgency" -a "Self-Heal" -i face-smile "$title" "$body" >/dev/null 2>&1
+  fi
+}
+
+# =================================================================== checks =
+# ---- USER TIER -------------------------------------------------------------
+
+check_user_failed_units() {
+  local allow="$USER_SERVICE_ALLOWLIST" u name
+  while read -r u; do
+    [ -n "$u" ] || continue
+    name="${u%% *}"; name="${name%.service}"
+    if ! unit_allowed "$name" "$allow"; then
+      skip "user unit '$name' failed but not on allowlist (notified only)"
+      warn "user unit failed: $name (not allowlisted — enable in ~/.config/self-heal.conf)"
+      continue
+    fi
+    vlog "restarting failed user unit: $name"
+    do_run systemctl --user reset-failed "$name"
+    do_run systemctl --user restart "$name"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      systemctl --user is-active --quiet "$name" \
+        && fix "restarted crashed user unit: $name" \
+        || warn "could not restart user unit: $name"
+    else
+      fix "(dry-run) would restart user unit: $name"
+    fi
+  done < <(systemctl --user --failed --no-legend --plain 2>/dev/null)
+  return 0
+}
+
+unit_allowed() { # unit_allowed NAME "ALLOWLIST"
+  local n; for n in $2; do [ "$n" = "$1" ] && return 0; done; return 1
+}
+
+check_audio_fix() {
+  [ "$AUDIO_AUTO_FIX" -eq 1 ] || { skip "audio auto-fix disabled"; return 0; }
+  command -v pactl >/dev/null 2>&1 || { skip "pactl not found"; return 0; }
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+  local sinks
+  if ! pactl info >/dev/null 2>&1 || [ -z "$(pactl list short sinks 2>/dev/null)" ]; then
+    vlog "audio server unresponsive or no sinks — restarting PipeWire stack"
+    do_run systemctl --user stop wireplumber
+    do_run systemctl --user restart pipewire pipewire-pulse
+    do_run systemctl --user start pipewire.socket pipewire-pulse.socket
+    do_run systemctl --user restart wireplumber
+    sleep 2
+    if [ "$DRY_RUN" -eq 0 ]; then
+      if [ -n "$(pactl list short sinks 2>/dev/null)" ]; then
+        fix "audio recovered (restarted pipewire + wireplumber)"
+      else
+        warn "audio still dead after PipeWire restart — check 'wpctl status'"
+      fi
+    else
+      fix "(dry-run) would restart pipewire/pipewire-pulse/wireplumber"
+    fi
+  else
+    vlog "audio OK"
+  fi
+  return 0
+}
+
+check_desktop_watch() {
+  # Plasma shell died but graphical session is alive -> bring it back
+  systemctl --user is-active --quiet graphical-session.target || { skip "no graphical session"; return 0; }
+  if ! pgrep -x plasmashell >/dev/null 2>&1; then
+    vlog "plasmashell process missing — restarting unit"
+    do_run systemctl --user restart plasma-plasmashell.service
+    if [ "$DRY_RUN" -eq 0 ]; then
+      sleep 3
+      pgrep -x plasmashell >/dev/null 2>&1 \
+        && fix "plasmashell was dead — desktop restored" \
+        || warn "plasmashell still missing after restart"
+    else
+      fix "(dry-run) would restart plasma-plasmashell (process missing)"
+    fi
+  else
+    vlog "plasmashell running"
+  fi
+  return 0
+}
+
+check_user_cache() {
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}"
+  [ -d "$cache" ] || { skip "no cache dir"; return 0; }
+  local mb; mb=$(( $(du -sm "$cache" 2>/dev/null | cut -f1) ))
+  vlog "~/.cache is ${mb} MB (limit $USER_CACHE_MAX_MB)"
+  if [ "$mb" -gt "$USER_CACHE_MAX_MB" ]; then
+    vlog "purging cache files unused for 30+ days"
+    do_run find "$cache" -xdev -depth -type f -atime +30 -delete
+    do_run find "$cache" -xdev -depth -type d -empty -delete
+    local after; after=$(( $(du -sm "$cache" 2>/dev/null | cut -f1) ))
+    fix "purged stale user cache (${mb} MB → ${after} MB)"
+  fi
+  local thumbs="$cache/thumbnails"
+  if [ -d "$thumbs" ]; then
+    mb=$(( $(du -sm "$thumbs" 2>/dev/null | cut -f1) ))
+    if [ "$mb" -gt "$THUMBNAIL_MAX_MB" ]; then
+      do_run find "$thumbs" -type f -delete
+      fix "purged ${mb} MB of thumbnails"
+    fi
+  fi
+  return 0
+}
+
+check_user_flatpak() {
+  [ "$USER_FLATPAK_REPAIR" -eq 1 ] || { skip "user flatpak repair disabled"; return 0; }
+  command -v flatpak >/dev/null 2>&1 || { skip "flatpak not found"; return 0; }
+  [ -n "$(flatpak list --user --app 2>/dev/null)" ] || { skip "no user flatpaks"; return 0; }
+  vlog "repairing user flatpak installations"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if out=$(flatpak repair --user 2>&1); then
+      grep -qi "removed\|repaired\|fixed" <<<"$out" \
+        && fix "flatpak user repair applied: $(grep -i 'removed\|repaired\|fixed' <<<"$out" | head -1)" \
+        || vlog "user flatpaks healthy"
+    else
+      warn "flatpak --user repair failed: $(head -1 <<<"$out")"
+    fi
+  else
+    echo "    [dry-run] flatpak repair --user"
+  fi
+  return 0
+}
+
+# ---- SYSTEM TIER -----------------------------------------------------------
+
+check_failed_units() {
+  local allow="$SERVICE_ALLOWLIST" u name
+  while read -r u; do
+    [ -n "$u" ] || continue
+    name="${u%% *}"; name="${name%.service}"
+    if ! unit_allowed "$name" "$allow"; then
+      # notify once per boot for unknown failed units
+      local key="notified_${name}_${BOOT_ID}"
+      if [ "$(state_get "$key" 0)" = "0" ]; then
+        state_set "$key" 1
+        warn "failed system unit: $name (not allowlisted — add to SERVICE_ALLOWLIST to auto-restart)"
+        notify critical "Self-Heal" "Service failed: $name\nNot on the auto-restart allowlist."
+      fi
+      continue
+    fi
+    vlog "restarting failed system unit: $name"
+    do_run systemctl reset-failed "$name"
+    do_run systemctl restart "$name"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      systemctl is-active --quiet "$name" \
+        && fix "restarted failed system service: $name" \
+        || warn "could not restart system service: $name"
+    else
+      fix "(dry-run) would restart system service: $name"
+    fi
+  done < <(systemctl --failed --no-legend --plain 2>/dev/null)
+  return 0
+}
+
+pct_used() { df --output=pcent "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+
+check_disk_space() {
+  local pct; pct=$(pct_used /)
+  vlog "/ usage: ${pct}% (threshold $DISK_THRESHOLD%)"
+  [ -n "$pct" ] || { skip "cannot read disk usage"; return 0; }
+  if [ "$pct" -lt "$DISK_THRESHOLD" ]; then return 0; fi
+  vlog "disk cleanup engaged"
+  # 1) vacuum journals
+  local jbefore; jbefore=$(du -sm /var/log/journal 2>/dev/null | cut -f1)
+  do_run journalctl --vacuum-size="$JOURNAL_MAX"
+  # 2) drop package caches
+  do_run dnf clean packages
+  # 3) remove unused flatpak runtimes
+  if command -v flatpak >/dev/null 2>&1 && [ -n "$(flatpak list --system 2>/dev/null)" ]; then
+    do_run flatpak uninstall --unused --noninteractive --system
+  fi
+  local after; after=$(pct_used /)
+  fix "disk cleanup: / ${pct}% → ${after}% (journals→$JOURNAL_MAX, dnf cache, unused flatpaks)"
+  if [ "$after" -ge "$DISK_CRITICAL" ]; then
+    warn "/ still at ${after}% after cleanup"
+    notify critical "Self-Heal" "Disk / at ${after}% after automatic cleanup.\nManual attention needed."
+  fi
+  return 0
+}
+
+check_journal_size() {
+  [ -d /var/log/journal ] || { skip "no persistent journal"; return 0; }
+  local mb; mb=$(du -sm /var/log/journal 2>/dev/null | cut -f1)
+  local maxmb; maxmb=$(numfmt --from=iec "$JOURNAL_MAX" 2>/dev/null | awk '{print int($1/1048576)}')
+  [ -n "$maxmb" ] || maxmb=500
+  vlog "/var/log/journal: ${mb} MB (cap ${maxmb} MB)"
+  if [ "$mb" -gt "$maxmb" ]; then
+    do_run journalctl --vacuum-size="$JOURNAL_MAX"
+    fix "journal vacuumed from ${mb} MB to cap $JOURNAL_MAX"
+  fi
+  return 0
+}
+
+check_boot_space() {
+  local pct; pct=$(pct_used /boot)
+  [ -n "$pct" ] || { skip "no /boot"; return 0; }
+  vlog "/boot usage: ${pct}%"
+  if [ "$pct" -lt "$BOOT_THRESHOLD" ]; then return 0; fi
+  if [ "$AUTO_REMOVE_OLD_KERNELS" -eq 1 ] && command -v dnf >/dev/null 2>&1; then
+    vlog "removing kernels beyond installonly_limit=$KERNELS_KEEP"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      if dnf -y remove --oldinstallonly --setopt=installonly_limit="$KERNELS_KEEP" >/dev/null 2>&1; then
+        fix "removed old kernels (kept $KERNELS_KEEP); /boot now $(pct_used /boot)%"
+      else
+        warn "old-kernel removal failed"
+      fi
+    else
+      echo "    [dry-run] dnf remove --oldinstallonly --setopt=installonly_limit=$KERNELS_KEEP"
+    fi
+  else
+    warn "/boot at ${pct}% — enable AUTO_REMOVE_OLD_KERNELS=1 to auto-remove old kernels"
+    notify critical "Self-Heal" "/boot is ${pct}% full.\nEnable AUTO_REMOVE_OLD_KERNELS in /etc/self-heal.conf to fix automatically."
+  fi
+  return 0
+}
+
+check_rpmdb() {
+  [ "$AUTO_FIX_RPMDB" -eq 1 ] || { skip "rpmdb auto-fix disabled"; return 0; }
+  # don't touch the db while a package transaction is running
+  if pgrep -x "dnf|dnf5|rpm|packagekitd" >/dev/null 2>&1; then
+    skip "package transaction in progress"; return 0
+  fi
+  local count
+  count=$(rpm -qa 2>/dev/null | wc -l)
+  if rpm -qa >/dev/null 2>&1 && [ "$count" -gt 100 ]; then
+    vlog "rpmdb healthy ($count packages)"; return 0
+  fi
+  vlog "rpmdb looks corrupted ($count packages readable) — rebuilding"
+  do_run rpm --rebuilddb
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if rpm -qa 2>/dev/null | wc -l | grep -qv '^0$'; then
+      fix "rebuilt corrupted RPM database"
+    else
+      warn "rpmdb rebuild did not help — manual recovery required"
+      notify critical "Self-Heal" "RPM database is corrupted and rebuild failed.\nRestore from backup or reinstall."
+    fi
+  else
+    fix "(dry-run) would rebuild RPM database"
+  fi
+  return 0
+}
+
+check_dnf_consistency() {
+  command -v dnf >/dev/null 2>&1 || { skip "dnf not found"; return 0; }
+  pgrep -x "dnf|dnf5|packagekitd" >/dev/null 2>&1 && { skip "dnf busy"; return 0; }
+  vlog "running dnf check (dependency sanity)"
+  if ! timeout 120 dnf check >/dev/null 2>&1; then
+    warn "dnf check reports dependency problems — run 'dnf check' for details"
+    notify normal "Self-Heal" "'dnf check' found dependency problems.\nRun 'sudo dnf check' to see them."
+  else
+    vlog "package dependencies consistent"
+  fi
+  return 0
+}
+
+check_cups_stuck() {
+  [ "$AUTO_CANCEL_CUPS" -eq 1 ] || { skip "cups auto-fix disabled"; return 0; }
+  command -v lpstat >/dev/null 2>&1 || { skip "cups tools missing"; return 0; }
+  systemctl is-active --quiet cups || { skip "cups not running"; return 0; }
+  local stuck; stuck=$(lpstat -W not-completed -o 2>/dev/null | wc -l)
+  [ "$stuck" -eq 0 ] && { vlog "print queue empty"; return 0; }
+  # only cancel if the journal shows the queue genuinely can't be serviced
+  if journalctl -b --no-pager -u cups 2>/dev/null | grep -q "Unable to queue job"; then
+    vlog "$stuck stuck job(s) and queue unserviceable — cancelling"
+    do_run cancel -a
+    if [ "$DRY_RUN" -eq 0 ]; then
+      fix "cancelled $stuck stuck print job(s) (printer unreachable)"
+      notify normal "Self-Heal" "Cancelled $stuck stuck print jobs.\nPower-cycle the printer, then print again."
+    else
+      fix "(dry-run) would cancel $stuck stuck print jobs"
+    fi
+  else
+    vlog "$stuck pending job(s), queue servicing — left alone"
+  fi
+  return 0
+}
+
+check_network() {
+  [ "$NETWORK_AUTO_BOUNCE" -eq 1 ] || { skip "network auto-bounce disabled"; return 0; }
+  systemctl is-active --quiet NetworkManager || { skip "NetworkManager inactive"; return 0; }
+  # is there a default route and a reachable gateway?
+  local gw; gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+  if [ -n "$gw" ] && ping -c1 -W2 "$gw" >/dev/null 2>&1; then
+    state_set NET_FAILS 0
+    vlog "network OK (gateway $gw reachable)"
+    return 0
+  fi
+  local fails; fails=$(state_get NET_FAILS 0); fails=$((fails+1)); state_set NET_FAILS "$fails"
+  vlog "network unreachable (run $fails/$NET_FAILS_BEFORE_BOUNCE)"
+  if [ "$fails" -ge "$NET_FAILS_BEFORE_BOUNCE" ]; then
+    vlog "bouncing NetworkManager"
+    do_run nmcli networking off
+    sleep 2
+    do_run nmcli networking on
+    state_set NET_FAILS 0
+    if [ "$DRY_RUN" -eq 0 ]; then
+      fix "bounced NetworkManager after $NET_FAILS_BEFORE_BOUNCE runs without connectivity"
+      notify normal "Self-Heal" "Network was dead — NetworkManager bounced."
+    else
+      fix "(dry-run) would bounce NetworkManager"
+    fi
+  fi
+  return 0
+}
+
+check_btrfs_watch() {
+  [ "$BTRFS_WATCH" -eq 1 ] || { skip "btrfs watchdog disabled"; return 0; }
+  [ "$(findmnt -no FSTYPE / 2>/dev/null)" = "btrfs" ] || { skip "root is not btrfs"; return 0; }
+  local errs
+  errs=$(journalctl -b --no-pager 2>/dev/null | grep -ci "btrfs.*error\|btrfs: error" || true)
+  if [ "${errs:-0}" -gt 0 ]; then
+    warn "btrfs reported $errs error(s) this boot — verify with 'sudo btrfs device stats /'"
+    notify critical "Self-Heal" "BTRFS errors detected this boot ($errs).\nCheck: sudo btrfs device stats /"
+    # make sure periodic scrubbing is on so corruption gets caught early
+    if systemctl list-unit-files "btrfs-scrub@*.timer" >/dev/null 2>&1; then
+      do_run systemctl enable --now "btrfs-scrub@-.timer"
+    fi
+  else
+    vlog "btrfs clean this boot"
+  fi
+  return 0
+}
+
+check_smart() {
+  [ "$SMART_CHECK" -eq 1 ] || { skip "SMART check disabled"; return 0; }
+  command -v smartctl >/dev/null 2>&1 || { skip "smartmontools not installed"; return 0; }
+  local d st
+  for d in /dev/sd? /dev/nvme?; do
+    [ -e "$d" ] || continue
+    smartctl -H "$d" >/dev/null 2>&1
+    st=$?
+    if (( st & 8 )); then
+      warn "SMART reports FAILING health on $d"
+      notify critical "Self-Heal" "Disk $d reports FAILING SMART health.\nBack up your data now."
+    else
+      vlog "SMART OK: $d"
+    fi
+  done
+  return 0
+}
+
+check_zram_sysctl() {
+  [ "$SWAPPINESS_FIX" -eq 1 ] || { skip "swappiness fix disabled"; return 0; }
+  [ -e /sys/block/zram0 ] || { skip "no zram"; return 0; }
+  local sw; sw=$(cat /proc/sys/vm/swappiness 2>/dev/null)
+  [ -n "$sw" ] || return 0
+  if [ "$sw" -lt 100 ]; then
+    vlog "vm.swappiness=$sw is wrong for zram — setting 180 + persisting"
+    do_run sysctl -w vm.swappiness=180
+    do_run bash -c 'echo "vm.swappiness = 180" > /etc/sysctl.d/90-self-heal-zram.conf'
+    fix "vm.swappiness $sw → 180 (zram-friendly, persisted to /etc/sysctl.d/90-self-heal-zram.conf)"
+  else
+    vlog "vm.swappiness=$sw OK for zram"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- registry --
+CHECKS_USER=(user_failed_units audio_fix desktop_watch user_cache user_flatpak)
+CHECKS_SYSTEM=(failed_units disk_space journal_size boot_space rpmdb dnf_consistency cups_stuck network btrfs_watch smart zram_sysctl)
+
+check_enabled() { # check_enabled NAME -> runs ONLY_CHECKS filter
+  [ "${#ONLY_CHECKS[@]}" -eq 0 ] && return 0
+  local n; for n in "${ONLY_CHECKS[@]}"; do [ "$n" = "$1" ] && return 0; done
+  return 1
+}
+
+# ------------------------------------------------------------------ drill ---
+do_drill() { # live-fire test of the healing loop; nonzero exit on failure
+  local fails=0 out tdir
+  pass() { say "  PASS  $1"; }
+  fail() { say "  FAIL  $1"; fails=$((fails+1)); }
+  say "self-heal drill — controlled failure injection ($([ "$ROOT" -eq 1 ] && echo system || echo user) tier)"
+
+  if [ "$ROOT" -eq 0 ]; then
+    # T1 — unknown crashed unit: must be detected + reported, NOT restarted
+    say " T1: fake crashed unit (detection + notification path)"
+    systemctl --user reset-failed self-heal-drill-fake.service 2>/dev/null
+    systemd-run --user --unit=self-heal-drill-fake /bin/false >/dev/null 2>&1
+    sleep 1
+    out=$("$0" --user run --no-notify 2>&1)
+    if grep -q "user unit failed: self-heal-drill-fake" <<<"$out"; then
+      pass "unknown unit failure detected and reported"
+    else
+      fail "fake unit failure went undetected"
+    fi
+    systemctl --user reset-failed self-heal-drill-fake.service 2>/dev/null
+
+    # T2 — dead audio stack: must self-recover
+    say " T2: dead audio (auto-recovery of the PipeWire stack — brief silence now)"
+    systemctl --user stop pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket wireplumber.service 2>/dev/null
+    sleep 1
+    out=$("$0" --user run --no-notify 2>&1)
+    sleep 3
+    if grep -q "audio recovered" <<<"$out" && [ -n "$(pactl list short sinks 2>/dev/null)" ]; then
+      pass "audio stack restarted, sinks are back"
+    else
+      fail "audio did not recover — check: systemctl --user status pipewire wireplumber"
+    fi
+
+    # T3 — stale cache purge, isolated so your real cache is never touched
+    say " T3: stale cache purge (isolated sandbox)"
+    tdir=$(mktemp -d)
+    mkdir -p "$tdir/cache/sub"
+    head -c 3000000 /dev/zero > "$tdir/cache/sub/junk.bin"
+    touch -a -d "40 days ago" "$tdir/cache/sub/junk.bin"
+    printf 'USER_CACHE_MAX_MB=1\n' > "$tdir/conf"
+    out=$(XDG_CACHE_HOME="$tdir/cache" "$0" --config "$tdir/conf" --user --no-notify check user_cache 2>&1)
+    if grep -q "purged stale user cache" <<<"$out" && [ ! -e "$tdir/cache/sub/junk.bin" ]; then
+      pass "oversized cache purged (3 MB sandbox, 1 MB threshold)"
+    else
+      fail "stale cache file survived the purge"
+    fi
+    rm -rf "$tdir"
+  else
+    # T4 — killed system service: allowlist restart must restore it
+    say " T4: SIGKILLed system service (allowlist restart: cups)"
+    if ! systemctl is-active --quiet cups; then
+      say "  SKIP  cups is not running"
+    else
+      systemctl kill --signal=KILL cups
+      sleep 1
+      out=$("$0" run --no-notify 2>&1)
+      sleep 2
+      if grep -q "restarted failed system service: cups" <<<"$out" && systemctl is-active --quiet cups; then
+        pass "cups was SIGKILLed and automatically restarted"
+      else
+        fail "cups not recovered — check: systemctl status cups"
+      fi
+    fi
+  fi
+
+  say ""
+  if [ "$fails" -eq 0 ]; then
+    say "drill complete: all tests passed ✔"
+    notify normal "Self-Heal drill" "All healing tests passed."
+  else
+    say "drill complete: $fails test(s) FAILED ✘"
+    notify critical "Self-Heal drill" "$fails test(s) failed — see terminal output."
+  fi
+  return "$fails"
+}
+
+# ------------------------------------------------------------------ modes ---
+do_checks() {
+  say "self-heal v$SELF_HEAL_VERSION — tier: $TIER$([ $DRY_RUN -eq 1 ] && echo ' (DRY RUN)')"
+  local c fn start=0
+  if [ "$TIER" = "user" ]; then
+    for c in "${CHECKS_USER[@]}"; do
+      check_enabled "$c" || continue
+      fn="check_$c"
+      say "» $c"; vlog "-- $c --"
+      "$fn"
+    done
+  else
+    for c in "${CHECKS_SYSTEM[@]}"; do
+      check_enabled "$c" || continue
+      fn="check_$c"
+      say "» $c"; vlog "-- $c --"
+      "$fn"
+    done
+  fi
+}
+
+summary() {
+  if [ "$FIXED" -gt 0 ]; then
+    log "summary: $FIXED fix(es), $WARNED warning(s)"
+    local list; list=$(printf '%s; ' "${ACTIONS[@]}")
+    notify normal "Self-Heal: $FIXED fix(es) applied" "${list%; }"
+  fi
+  [ "$WARNED" -gt 0 ] && [ "$FIXED" -eq 0 ] && \
+    notify normal "Self-Heal: $WARNED warning(s)" "See journal: journalctl -u self-heal.service"
+  say "done: $FIXED fix(es), $WARNED warning(s)"
+}
+
+do_status() {
+  echo "── self-heal v$SELF_HEAL_VERSION ─────────────────────────────"
+  echo " disk /     : $(pct_used / 2>/dev/null || echo '?')% used   /boot: $(pct_used /boot 2>/dev/null || echo '-')% used"
+  echo " memory     : $(free -m | awk '/Mem:/{printf "%d/%d MB", $3, $2}')   swap(zram): $(free -m | awk '/Swap:/{print $3"/"$2" MB"}')"
+  echo " journal    : $(du -sh /var/log/journal 2>/dev/null | cut -f1 || echo '-')  (cap $JOURNAL_MAX)"
+  echo " failed sys : $(systemctl --failed --no-legend --plain 2>/dev/null | wc -l) unit(s)"
+  echo " failed usr : $(systemctl --user --failed --no-legend --plain 2>/dev/null | wc -l) unit(s)"
+  echo " audio      : $(pactl list short sinks 2>/dev/null | wc -l) sink(s)"
+  echo " zram       : $([ -e /sys/block/zram0 ] && echo active || echo none)  swappiness: $(cat /proc/sys/vm/swappiness 2>/dev/null)"
+  echo "── timers ──"
+  systemctl list-timers 'self-heal*' --no-legend --plain 2>/dev/null || echo " (system timer not installed — run: sudo ~/self-heal/install.sh)"
+  systemctl --user list-timers 'self-heal*' --no-legend --plain 2>/dev/null
+  echo "── last activity ──"
+  if [ -r "$LOG_FILE" ]; then
+    tail -n 8 "$LOG_FILE"
+  else
+    journalctl -u self-heal.service -n 8 --no-pager 2>/dev/null || echo " (system log is root-only: sudo tail /var/log/self-heal.log)"
+  fi
+}
+
+case "$MODE" in
+  run)     log "=== run start (dry=$DRY_RUN) ==="; do_checks; summary; log "=== run end ===" ;;
+  status)  do_status ;;
+  drill)   do_drill; exit $? ;;
+  checks)
+    echo "user tier:   ${CHECKS_USER[*]}"
+    echo "system tier: ${CHECKS_SYSTEM[*]}" ;;
+esac
+exit 0

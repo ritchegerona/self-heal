@@ -1,0 +1,13 @@
+[Unit]
+Description=Self-Heal — automatic system diagnosis and repair
+Documentation=man:self-heal(8)
+After=multi-user.target network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/self-heal
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/self-heal run
+Nice=10
+IOSchedulingClass=idle
+SyslogIdentifier=self-heal

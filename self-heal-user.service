@@ -1,0 +1,10 @@
+[Unit]
+Description=Self-Heal — automatic user-session diagnosis and repair
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/self-heal --user run
+Nice=10
+SyslogIdentifier=self-heal-user

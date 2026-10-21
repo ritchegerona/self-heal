@@ -1,0 +1,10 @@
+[Unit]
+Description=Self-Heal — user-session repair every 10 minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=10min
+RandomizedDelaySec=90s
+
+[Install]
+WantedBy=timers.target

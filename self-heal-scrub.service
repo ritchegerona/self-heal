@@ -1,0 +1,10 @@
+[Unit]
+Description=Self-Heal — btrfs scrub of the root filesystem (data integrity)
+RequiresMountsFor=/
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/btrfs scrub start -B /
+Nice=19
+IOSchedulingClass=idle
+SyslogIdentifier=self-heal-scrub
