@@ -1,14 +1,39 @@
-# Self-Heal for Fedora 44 + KDE Plasma
+# Self-Heal for Fedora + KDE Plasma
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/ritchegerona/self-heal)](https://github.com/ritchegerona/self-heal/releases)
+[![Tests](https://img.shields.io/badge/drill-3%2F3%20PASS-brightgreen)](#commands)
 
 Automatic error detection and repair for your system, running on a timer.
 Every fix is logged and shown as a KDE desktop notification.
 
-## Install (one time)
+## Install
+
+**From a release (RPM, recommended):**
 
 ```bash
-cd ~/self-heal
+sudo dnf install https://github.com/ritchegerona/self-heal/releases/latest/download/self-heal-1.0.0-1.fc44.noarch.rpm
+```
+
+This installs the engine, systemd timers (system tier auto-enabled), the
+monthly btrfs scrub timer on btrfs systems, logrotate config, and a default
+`/etc/self-heal.conf`. Then opt in to session-level healing:
+
+```bash
+systemctl --user enable --now self-heal-user.timer
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/ritchegerona/self-heal.git
+cd self-heal
 sudo ./install.sh
 ```
+
+> Use one install method, not both — the source installer puts things in
+> `/usr/local/bin` + `/etc/systemd/system`, the RPM in `/usr/bin` +
+> `/usr/lib/systemd/system`. Mixing them shadows the RPM copy.
 
 That enables two timers:
 
