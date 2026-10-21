@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/ritchegerona/self-heal)](https://github.com/ritchegerona/self-heal/releases)
+[![COPR](https://img.shields.io/badge/COPR-ritchegerona%2Fself--heal-blue)](https://copr.fedorainfracloud.org/coprs/ritchegerona/self-heal/)
 [![Tests](https://img.shields.io/badge/drill-3%2F3%20PASS-brightgreen)](#commands)
 
 Automatic error detection and repair for your system, running on a timer.
@@ -9,21 +10,19 @@ Every fix is logged and shown as a KDE desktop notification.
 
 ## Install
 
-**From a release (RPM, recommended):**
+**From COPR (recommended — install + updates via dnf):**
 
 ```bash
-sudo dnf install https://github.com/ritchegerona/self-heal/releases/latest/download/self-heal-1.0.0-1.fc44.noarch.rpm
+sudo dnf copr enable ritchegerona/self-heal
+sudo dnf install self-heal
+systemctl --user enable --now self-heal-user.timer   # optional session tier
 ```
 
-This installs the engine, systemd timers (system tier auto-enabled), the
+The RPM installs the engine, systemd timers (system tier auto-enabled), the
 monthly btrfs scrub timer on btrfs systems, logrotate config, and a default
-`/etc/self-heal.conf`. Then opt in to session-level healing:
+`/etc/self-heal.conf`.
 
-```bash
-systemctl --user enable --now self-heal-user.timer
-```
-
-**From source:**
+**From a GitHub release (manual RPM):**
 
 ```bash
 git clone https://github.com/ritchegerona/self-heal.git
